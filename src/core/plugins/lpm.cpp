@@ -114,6 +114,20 @@ void lpm_t::rkOrder(int order)
   o_coeffRK = platform->device.malloc<dfloat>(solverOrder);
 }
 
+void lpm_t::bdfextOrder(int order)
+{
+  nekrsCheck(order < 1 || order > 3,
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "Invalid BDFEXT order (%d)!\n",
+             order);
+  nekrsCheck(initialized_, platform->comm.mpiComm(), EXIT_FAILURE, "%s\n", "lpm_t already initialized!");
+  solverOrder = order;
+
+  dt.resize(solverOrder + 1);
+}
+
+
 lpm_t::SolverType lpm_t::stringToSolverType(const std::string &_solverType)
 {
   auto solverType = lowerCase(_solverType);
@@ -123,6 +137,10 @@ lpm_t::SolverType lpm_t::stringToSolverType(const std::string &_solverType)
 
   if (solverType == "rk") {
     return SolverType::RK;
+  }
+
+  if (solverType == "bdfext") {
+    return SolverType::BDFEXT;
   }
 
   return SolverType::INVALID;
@@ -261,6 +279,106 @@ void lpm_t::addInterpField(const std::string &interpFieldName, const occa::memor
   addInterpField(interpFieldName, 1, mesh->Nlocal, o_fld, output);
 }
 
+void lpm_t::addDynamicInterpField(const std::string &interpFieldName,
+                           int Nfields,
+                           dlong fieldOffset,
+                           std::function<occa::memory()> provider) {
+
+  auto interpFieldNameLower = lowerCase(interpFieldName);
+
+  if (interpFieldIds.count(interpFieldNameLower) == 0) {
+    // Get initial data from the provider and verify if it returns the correctly sized data
+    auto o_init = provider();
+    nekrsCheck(o_init.size() != static_cast<size_t>(Nfields)*static_cast<size_t>(fieldOffset),
+              MPI_COMM_SELF,
+              EXIT_FAILURE,
+              "Dynamic interpField %s initial data size mismatch: got %zu, expected %zu!\n",
+              interpFieldName.c_str(),
+              o_init.size(),
+              static_cast<size_t>(Nfields)*static_cast<size_t>(fieldOffset));
+
+    // Register as a regular interpField (using lowercase)
+    addInterpField(interpFieldNameLower, Nfields, fieldOffset, o_init, true);
+
+    // Add to dynamic fields vector (using lowercase)
+    dynamicInterpFields.push_back({interpFieldNameLower, Nfields, fieldOffset, provider});
+  }
+  else {
+    if (platform->comm.mpiRank() == 0) {
+      std::cout << "WARNING: dynamic interpField " << interpFieldName 
+                << " already registered! Skipping..." << std::endl;
+    }
+  }
+}
+
+void lpm_t::refreshDynamicInterpFields() {
+  // Group this work under the integrate hierarchy for consistent timer trees
+  if (timerLevel == TimerLevel::Detailed) {
+    platform->timer.tic(timerName + "integrate::refreshDynamic");
+  }
+
+  for (const auto &f : dynamicInterpFields) {
+    // Update the field input with a pointer to fresh data
+    interpFieldInputs.at(f.name) = f.provider();
+  }
+
+  if (timerLevel == TimerLevel::Detailed) {
+    platform->timer.toc(timerName + "integrate::refreshDynamic");
+  }
+}
+
+void lpm_t::setupBDFEXT() {
+  if (nrs == nullptr) {
+    nekrsCheck(true,
+               MPI_COMM_SELF,
+               EXIT_FAILURE,
+               "%s\n",
+               "Cannot setup BDFEXT without attaching nrs_t!");
+  }
+
+  // Register particle velocity DOFs
+  addVariable("vx"); // x-velocity
+  addVariable("vy"); // y-velocity
+  addVariable("vz"); // z-velocity
+
+  // nrs->o_U is a static field
+  addInterpField("Velocity", 
+                 mesh->dim,         // 3 components (u, v, w)
+                 nrs->fieldOffset,
+                 nrs->o_U,
+                 true);
+
+  // Vorticity added as a dynamic field since it needs to be recomputed at each time step
+  auto vorticityProvider = [this]() -> occa::memory {
+    auto o_SijOij = nrs->strainRotationRate(false);
+    return o_SijOij.slice(6*nrs->fieldOffset, 3*nrs->fieldOffset); // ωz, ωy, ωx are at offsets 6,7,8
+  };
+  addDynamicInterpField("Vorticity",
+                        mesh->dim,         // 3 components (ωz, ωy, ωx)
+                        nrs->fieldOffset,
+                        vorticityProvider);
+
+  // Material derivative added as a dynamic field since it needs to be recomputed at each time step
+  auto dudtProvider = [this]() -> occa::memory {
+    // FIXME: Just a placeholder; actual DuDt computation should be implemented here
+    return nrs->o_U;
+  };
+  addDynamicInterpField("DuDt",
+                        mesh->dim,         // 3 components (DuDt, DvDt, DwDt)
+                        nrs->fieldOffset,
+                        dudtProvider);
+
+  // Explicit RHS term added as a property
+  for (int j=1; j<=solverOrder; j++) {
+    addProp(mesh->dim, "f"+std::to_string(j), false);
+  }
+
+  // particle state vector history for BDFEXT stored as a property
+  for (int j=1; j<=solverOrder; j++) {
+    addProp(this->nDOFs(), "y"+std::to_string(j), false);
+  }
+}
+
 int lpm_t::interpFieldId(const std::string &_interpFieldName) const
 {
   auto interpFieldName = lowerCase(_interpFieldName);
@@ -388,6 +506,11 @@ void lpm_t::initialize(int nParticles, double t0, const std::vector<dfloat> &y0)
 
 void lpm_t::initialize(int nParticles, double t0, const occa::memory &o_y0)
 {
+  // Ensure BDFEXT interpolation fields are registered
+  if (solverType == SolverType::BDFEXT) {
+    setupBDFEXT();
+  }
+
   nekrsCheck(initialized_, platform->comm.mpiComm(), EXIT_FAILURE, "%s\n", "lpm_t already initialized!");
   nekrsCheck(o_y0.length() != nParticles * nDOFs_,
              platform->comm.mpiComm(),
@@ -485,6 +608,9 @@ void lpm_t::integrate(double tf)
   // NOTE: need to also cache the initial condition of the user-added
   // interpolated fields
   if (time >= tf) {
+    // Ensure dynamic fields are up-to-date before final particle checkpoints are dumped
+    refreshDynamicInterpFields();
+
     for (auto [fieldName, o_field] : laggedInterpFields) {
       const auto Nfields = numFieldsInterp(fieldName);
       const auto offset = offsetFieldsInterp[fieldName];
@@ -497,6 +623,9 @@ void lpm_t::integrate(double tf)
     }
     return;
   }
+
+  // refresh dynamic interp fields before lagging previous time states
+  refreshDynamicInterpFields();
 
   // set time step
   dfloat dtStep = tf - time;
@@ -550,7 +679,7 @@ void lpm_t::integrate(double tf)
   dtEXT[1] = tf - time;
   time = tf;
 
-  // lag previous time states in laggedInterpFields
+  // NOTE: Lag previous time states in laggedInterpFields
   for (auto [fieldName, o_field] : laggedInterpFields) {
     const auto Nfields = numFieldsInterp(fieldName);
     const auto offset = offsetFieldsInterp[fieldName];

@@ -7,6 +7,14 @@
 #include <map>
 #include "pointInterpolation.hpp"
 
+// A structure to hold dynamic interpolation field information
+struct DynamicInterpField {
+  std::string name;
+  int nComponents;
+  dlong fieldOffset;
+  std::function<occa::memory()> provider; // Function to provide fresh data
+};
+
 // Lagrangian particle manager
 class lpm_t
 {
@@ -29,6 +37,12 @@ public:
  
   lpm_t(mesh_t* mesh, dfloat* dt, dfloat bb_tol = 0.01, dfloat newton_tol = 0.0);
 
+  void attachNRS(nrs_t* nrs_) {
+    nekrsCheck(initialized_, platform->comm.mpiComm(), EXIT_FAILURE, 
+               "%s\n", "Cannot attach NRS after initialization!");
+    nrs = nrs_;
+  }
+
   // set extrapolation order
   void extOrder(int order);
 
@@ -37,6 +51,9 @@ public:
 
   // set RK integration order (1,2,3 or 4)
   void rkOrder(int order);
+
+  // set BDFEXT integration order
+  void bdfextOrder(int order);
 
   // set ODE solver
   void setSolver(const std::string &solver);
@@ -69,6 +86,15 @@ public:
   // Multi-component field version
   // On output, this field will be output to the VTU file as a vector quantity.
   void addProp(dlong Nfields, const std::string &propName, bool output = true);
+
+  // A dynamic interpolation field associated with the fluid mesh whose values 
+  // are interpolated to the particle locations.
+  // This field is "dynamic" since its memory pointer is not static and is 
+  // provided by a user-defined function "provider".
+  void addDynamicInterpField(const std::string &interpFieldName,
+                             int Nfields,
+                             dlong fieldOffset,
+                             std::function<occa::memory()> provider);  // A lambda/function that provides fresh mesh-side data
 
   // Fields associated with the fluid mesh to be interpolated
   // to the particle locations.
@@ -259,6 +285,8 @@ public:
 private:
   mesh_t *mesh;
 
+  nrs_t* nrs = nullptr;
+
   dfloat* dtOuter;
 
   int nEXT;
@@ -273,7 +301,7 @@ private:
   // maximum number of entries valid for lpm_t::migration call
   static constexpr int maxEntriesPerParticleMigration = 50;
 
-  enum class SolverType { AB, RK, INVALID };
+  enum class SolverType { AB, RK, BDFEXT, INVALID };
 
   occa::memory o_ytmp; // scratch memory for RK integrators
   occa::memory o_k;    // k1, ... for RK integrators
@@ -319,6 +347,11 @@ private:
   // helper function to extrapolate fluid state to a specified time
   void extrapolateFluidState(dfloat tEXT);
 
+  // Recompute the dynamic interpolation fields by calling their providers
+  void refreshDynamicInterpFields();
+  // Do all setup needed for BDFEXT: interpolated fields, coefficients, histories, etc.
+  void setupBDFEXT();
+
   // implements AB integrator
   void integrateAB();
 
@@ -328,6 +361,8 @@ private:
   void integrateRK2();
   void integrateRK3();
   void integrateRK4();
+
+  void integrateBDFEXT();
 
   // generate set of all output DOFs, sans {x,y,z}
   std::set<std::string> nonCoordinateOutputDOFs() const;
@@ -384,6 +419,9 @@ private:
   std::map<std::string, int> propIds;
   std::map<std::string, int> propCounts;
   std::map<std::string, bool> outputProps;
+
+  // Container for dynamic interpolation fields
+  std::vector<DynamicInterpField> dynamicInterpFields;
 
   // Interpolated fields
   std::map<std::string, int> interpFieldIds;
