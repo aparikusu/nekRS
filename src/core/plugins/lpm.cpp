@@ -124,7 +124,20 @@ void lpm_t::bdfextOrder(int order)
   nekrsCheck(initialized_, platform->comm.mpiComm(), EXIT_FAILURE, "%s\n", "lpm_t already initialized!");
   solverOrder = order;
 
+  g0BDF = 1.0;
   dt.resize(solverOrder + 1);
+  coeffBDF.resize(solverOrder);
+  coeffEXTp.resize(solverOrder);
+
+  if (o_coeffBDF.byte_size()) {
+    o_coeffBDF.free();
+  }
+  o_coeffBDF = platform->device.malloc<dfloat>(solverOrder);
+
+  if (o_coeffEXTp.byte_size()) {
+    o_coeffEXTp.free();
+  }
+  o_coeffEXTp = platform->device.malloc<dfloat>(solverOrder);
 }
 
 
@@ -171,10 +184,15 @@ void lpm_t::addVariable(dlong Nfields, const std::string &_dofName, bool output)
              "cannot register DOF %s after calling initialize!\n",
              dofName.c_str());
 
-  const auto nDOFs = dofIds.size();
+  // FIX: Previously, we used dofIds.size() (the count of registered variables) as the ID.
+  // This caused a bug for vector variables (Nfields > 1) because their components would
+  // overlap with the next variable's memory space.
+  //
+  // We now use nDOFs_ (the total number of scalar components registered so far) as the ID.
+  // This means 'dofIds' now correctly represents the memory offset where this variable begins.
   if (dofIds.count(dofName) == 0) {
     dofNames.push_back(dofName);
-    dofIds[dofName] = nDOFs;
+    dofIds[dofName] = nDOFs_;
     outputDofs[dofName] = output;
     dofCounts[dofName] = Nfields;
     nDOFs_ += Nfields;
@@ -218,9 +236,14 @@ void lpm_t::addProp(dlong Nfields, const std::string &_propName, bool output)
              "cannot register prop %s after calling initialize!\n",
              propName.c_str());
 
-  const auto nprops = propIds.size();
+  // FIX: Previously, we used propIds.size() (the count of registered properties) as the ID.
+  // This caused a bug for vector properties (Nfields > 1) because their components would 
+  // overlap with the next property's memory space.
+  //
+  // We now use nProps_ (the total number of scalar components registered so far) as the ID.
+  // This means 'propIds' now correctly represents the memory offset where this property begins.
   if (propIds.count(propName) == 0) {
-    propIds[propName] = nprops;
+    propIds[propName] = nProps_;
     outputProps[propName] = output;
     propCounts[propName] = Nfields;
     nProps_ += Nfields;
@@ -368,14 +391,10 @@ void lpm_t::setupBDFEXT() {
                         nrs->fieldOffset,
                         dudtProvider);
 
-  // Explicit RHS term added as a property
+  // Explicit RHS term and paricle state vector at a time level added as properties
   for (int j=1; j<=solverOrder; j++) {
     addProp(mesh->dim, "f"+std::to_string(j), false);
-  }
-
-  // particle state vector history for BDFEXT stored as a property
-  for (int j=1; j<=solverOrder; j++) {
-    addProp(this->nDOFs(), "y"+std::to_string(j), false);
+    addProp(mesh->dim+1, "A"+std::to_string(j), false); // 3 off-diagonal terms and 1 diagonal term
   }
 }
 
@@ -555,10 +574,22 @@ void lpm_t::abCoeff(dfloat *dt, int tstep)
   for (int i = 0; i < order; ++i) {
     coeffAB[i] *= dt[0];
   }
+  // FIXME: This loop is dead code. i starts at order, so i > order is immediately false.
   for (int i = order; i > order; i--) {
     coeffAB[i - 1] = 0.0;
   }
   o_coeffAB.copyFrom(coeffAB.data(), solverOrder);
+}
+
+void lpm_t::bdfextCoeff(dfloat *dt, int tstep) {
+  const int order = std::min(tstep, this->solverOrder);
+  nek::bdfCoeff(&g0BDF, coeffBDF.data(), dt.data(), order);
+  nek::extCoeff(coeffEXTp.data(), dt.data(), order, order);
+  for (int i=solverOrder; i>order; i--) {
+    coeffEXTp[i - 1] = 0.0;
+  }
+  o_coeffBDF.copyFrom(coeffBDF.data(), solverOrder);
+  o_coeffEXTp.copyFrom(coeffEXTp.data(), solverOrder);
 }
 
 void lpm_t::interpolate()
@@ -608,9 +639,6 @@ void lpm_t::integrate(double tf)
   // NOTE: need to also cache the initial condition of the user-added
   // interpolated fields
   if (time >= tf) {
-    // Ensure dynamic fields are up-to-date before final particle checkpoints are dumped
-    refreshDynamicInterpFields();
-
     for (auto [fieldName, o_field] : laggedInterpFields) {
       const auto Nfields = numFieldsInterp(fieldName);
       const auto offset = offsetFieldsInterp[fieldName];
@@ -623,9 +651,6 @@ void lpm_t::integrate(double tf)
     }
     return;
   }
-
-  // refresh dynamic interp fields before lagging previous time states
-  refreshDynamicInterpFields();
 
   // set time step
   dfloat dtStep = tf - time;
@@ -671,6 +696,8 @@ void lpm_t::integrate(double tf)
   } else {
     if (solverType == SolverType::AB) {
       integrateAB();
+    } else if (solverType == SolverType::BDFEXT) {
+        integrateBDFEXT();
     } else if (solverType == SolverType::RK) {
       integrateRK();
     }
@@ -678,6 +705,9 @@ void lpm_t::integrate(double tf)
 
   dtEXT[1] = tf - time;
   time = tf;
+
+  // refresh dynamic interp fields before lagging previous time states
+  refreshDynamicInterpFields();
 
   // NOTE: Lag previous time states in laggedInterpFields
   for (auto [fieldName, o_field] : laggedInterpFields) {
@@ -771,6 +801,50 @@ void lpm_t::integrateAB()
     if (nParticles_ > 0) {
       nStagesSumManyKernel(nParticles_, fieldOffset_, solverOrder, nDOFs_, o_coeffAB, o_ydot, o_y);
     }
+  }
+}
+
+void lpm_t::integrateBDFEXT()
+{
+  bdfextCoeff(dt.data(), tstep);
+
+  // ALIAS: Reuse o_ydot memory to store the history of y (y_n, y_n-1, ...)
+  // helps readability
+  occa::memory& o_yHist = o_ydot;
+
+  // lag derivatives and previous states
+  if (nParticles_>0) {
+    const auto N = nDOFs_ * fieldOffset_;
+    for (int s=solverOrder; s>1; s--) {
+      // Lag properties: [f(s-1),A(s-1)] -> [f(s),A(s)]
+      // thankfully f and A are stored contiguously in o_prop
+      const auto propoffset_src  = propId("f"+std::to_string(s-1)) * fieldOffset_;
+      const auto propoffset_dest = propId("f"+std::to_string(s)) * fieldOffset_;
+      const auto propCount = numProps("f1") + numProps("A1");
+      o_prop.copyFrom(o_prop, propCount*fieldOffset_, propoffset_dest, propoffset_src);
+
+      const auto N = nDOFs_ * fieldOffset_;
+      o_yHist.copyFrom( o_yHist, N, (s-1)*N, (s-2)*N );
+    }
+    o_yHist.copyFrom(o_y, N);
+  }
+
+  platform->timer.tic(timerName + "integrate::userRHS");
+  deviceMemory<dfloat> o_y_(o_y);
+  deviceMemory<dfloat> o_f_(getProp("f1"));
+  userRHS_(this, time, o_y_, userdata_, o_f_);
+  platform->timer.toc(timerName + "integrate::userRHS");
+
+  if (nParticles_ > 0) {
+    launchKernel("lpm-integrate-bdfext",
+                 mesh->Nlocal,
+                 nDOFs_,
+                 fieldOffset_,
+                 g0BDF,
+                 o_coeffBDF,
+                 o_coeffEXTp,
+                 o_prop,
+                 o_y);
   }
 }
 

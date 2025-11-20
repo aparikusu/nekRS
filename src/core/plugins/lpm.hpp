@@ -369,6 +369,8 @@ private:
 
   void abCoeff(dfloat *dt, int tstep);
 
+  void bdfextCoeff(dfloat *dt, int tstep);
+
   double time = 0.0;
   int tstep = 0;
 
@@ -390,6 +392,13 @@ private:
 
   std::vector<dfloat> coeffAB;
   occa::memory o_coeffAB; // AB coefficients
+
+  dfloat g0BDF;
+  std::vector<dfloat> coeffBDF;
+  occa::memory o_coeffBDF; // BDF coefficients for BDFEXT
+
+  std::vector<dfloat> coeffEXTp;
+  occa::memory o_coeffEXTp;   // EXT coefficients for BDFEXT
 
   std::vector<dfloat> coeffRK;
   occa::memory o_coeffRK; // RK coefficients

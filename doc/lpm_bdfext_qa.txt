@@ -6,6 +6,19 @@ Purpose: Track conceptual questions and explanations encountered during
          BDFEXT timestepper implementation for nekRS Lagrangian particles
 
 ================================================================================
+0. AI AGENT PROTOCOLS & GUIDELINES
+================================================================================
+**Role**: Guide and Support.
+**Constraint**: DO NOT edit source code (`.cpp`, `.hpp`, `.okl`) directly unless explicitly authorized for a specific task. The user prefers to type the code or copy-paste.
+**Context**: The project is `nekRS`, specifically the `LPM` (Lagrangian Particle Method) plugin.
+**Current State**: BDFEXT implementation is in progress.
+**Key Instructions**:
+- Always verify logic before suggesting edits.
+- Prefer `propId("name")` over `propIds["name"]` for safety.
+- Ensure `o_yHist` (alias for `o_ydot`) is used for state history.
+- Ensure `A` and `f` histories are stored in properties.
+
+================================================================================
 TABLE OF CONTENTS
 ================================================================================
 1. QUICK REFERENCE - Essential Design Decisions (line 10)
@@ -1471,25 +1484,111 @@ void lpm_t::setupBDFEXT() {
 }
 ```
 
+Q19: Correction on Memory Strategy - Reusing o_ydot for State History
+--------------------------------------------------------------------------------
+**Question**: Q17 proposed using `o_ydot` for Matrix A history. Is there a better use for this memory?
+
+**Analysis**:
+- `o_ydot` is allocated as `solverOrder * nDOFs * fieldOffset`.
+- In AB/RK, it stores derivatives ($dy/dt$).
+- In BDFEXT, we don't explicitly store derivatives (they are implicit in the BDF formula).
+- We DO need to store state history ($y^{n}, y^{n-1}, \dots$) for the BDF discretization.
+- Storing state history in properties (as proposed in Q17/Q18) works but is slightly inefficient (extra map lookups, fragmented).
+
+**New Decision**:
+- **Reuse `o_ydot` to store State History ($y$)**.
+- **Move Matrix A history to Properties**.
+
+**Rationale**:
+1.  **Size Match**: `o_ydot` is exactly the right size to store `solverOrder` levels of `y` (6 DOFs).
+2.  **Semantics**: `o_ydot` is "history memory". Using it for `y` history is cleaner than using it for `A` matrices.
+3.  **Aliasing**: We can create a reference `occa::memory& o_yHist = o_ydot;` in the code to make the intent clear.
+4.  **Matrix A**: Since `o_ydot` is taken, `A` (6 components) moves to properties (`A1`, `A2`, ...). This is fine as `A` is just coefficients.
+
+**Revised Storage Map**:
+- `o_y`: Current state ($y^{n+1}$ being computed).
+- `o_ydot` (alias `o_yHist`): History states $y^n, y^{n-1}, \dots$.
+- Properties `f1`...`fk`: Forcing history (3 components).
+- Properties `A1`...`fk`: Matrix A history (6 components).
+
+Q20: Correct usage of copyFrom for history shifting
+--------------------------------------------------------------------------------
+**Question**: How do we correctly shift history arrays using `copyFrom`?
+
+**Context**:
+We need to shift history: $y^{n-k} \leftarrow y^{n-k+1}$.
+This means copying *from* newer index *to* older index.
+
+**API**:
+`dest.copyFrom(src, count, destOffset, srcOffset)`
+
+**Correct Pattern (Loop backwards)**:
+To shift `o_yHist` (which stores $[y^n, y^{n-1}, \dots]$ at indices $0, 1, \dots$):
+Actually, usually index 0 is most recent.
+Let's say `o_yHist` stores $[y^n, y^{n-1}, y^{n-2}]$.
+At step end, we want to push $y^{n+1}$ into slot 0, moving $y^n$ to slot 1, etc.
+
+Shift loop:
+```cpp
+// Shift older levels: y[j] = y[j-1]
+// Must go from oldest to newest to avoid overwriting
+for (int j = solverOrder - 1; j > 0; --j) {
+    size_t sz = nDOFs_ * fieldOffset_;
+    // dest: j, src: j-1
+    o_yHist.copyFrom(o_yHist, sz, j * sz, (j - 1) * sz);
+}
+// Capture current state into slot 0
+o_yHist.copyFrom(o_y, nDOFs_ * fieldOffset_, 0, 0);
+```
+
+**Common Pitfall**:
+Swapping `destOffset` and `srcOffset`.
+Remember: `copyFrom(source, size, DEST_OFFSET, SRC_OFFSET)`.
+
+Q21: Safe Property Access - propId() vs map[]
+--------------------------------------------------------------------------------
+**Question**: Why use `propId("name")` instead of `propIds["name"]`?
+
+**Issue**:
+`std::map::operator[]` ("`propIds["name"]`") has a side effect: if the key doesn't exist, it **inserts** a new entry with a default value (0) and returns it.
+- If you typo a name, you get 0 instead of an error.
+- If you access a property that hasn't been registered yet, you silently create garbage data.
+
+**Solution**:
+Use the helper function `propId("name")`.
+- It handles case sensitivity (converts to lowercase).
+- It checks for existence.
+- It throws a clear error or returns a valid ID.
+- It prevents accidental insertion of invalid keys.
+
+**Code**:
+```cpp
+// BAD
+int id = propIds["Velocity"]; // Might create "velocity" -> 0 if not found
+
+// GOOD
+int id = propId("Velocity"); // Throws if missing, handles case
+```
+
 ================================================================================
 END OF Q&A LOG - FINAL STATUS SUMMARY
 ================================================================================
 
-**Document Version**: November 18, 2025
-**Implementation Progress**: 60% complete (Steps 1-9 of 15 done)
+**Document Version**: November 19, 2025
+**Implementation Progress**: 65% complete (Steps 1-9 done, Step 10 in progress)
 
 **What's Been Accomplished**:
 ✅ Complete design specification finalized
 ✅ All major design decisions documented and justified
 ✅ Infrastructure complete (dynamic fields, nrs attachment, field registration)
-✅ Storage strategy optimized (reuse o_ydot, use properties)
+✅ Storage strategy optimized (reuse o_ydot for y_hist, use properties for A and f)
 ✅ Computational approach optimized (3×3 solve, 4× speedup)
 ✅ Memory layout verified to fit existing allocations
 ✅ No migration code changes required
-✅ Step 9: Property registration complete (f1..fk, y1..yk)
+✅ Step 9: Property registration complete (f1..fk, A1..Ak)
 
 **What's Next**:
-→ Step 10: integrateBDFEXT() main routine
+→ Step 10: integrateBDFEXT() main routine (Implementation in progress)
 → Step 11: BDFEXT device kernel (3×3 solve + position update)
 → Step 13: bdfCoeff() for variable timestep α coefficients
 → Step 14: Wire into integrate() dispatcher
@@ -1497,14 +1596,14 @@ END OF Q&A LOG - FINAL STATUS SUMMARY
 
 **Key Files**:
 - doc/lpm_bdfext_qa.txt: This file (complete design + learning journal)
-- src/core/plugins/lpm.cpp: Implementation (Steps 1-9 complete)
+- src/core/plugins/lpm.cpp: Implementation (Steps 1-9 complete, Step 10 active)
 - src/core/plugins/lpm.hpp: Header (no changes needed for Step 9)
 
 **Critical Numbers**:
 - 6 DOFs (position + velocity) vs 3 for AB/RK
 - 3×3 implicit solve (~50 FLOPs) vs 6×6 (~200 FLOPs)
-- 9×solverOrder properties per particle (f_hist: 3×k, q_hist: 6×k)
-- 6 elements per A matrix level in o_ydot (anti-symmetric + diagonal)
+- 9×solverOrder properties per particle (f_hist: 3×k, A_hist: 6×k)
+- State history (y_hist) stored in o_ydot (reused, 6×k elements)
 
 **For Future Readers**:
 This document captures the complete design journey from initial concept to 
