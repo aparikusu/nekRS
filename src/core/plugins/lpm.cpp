@@ -351,12 +351,12 @@ void lpm_t::refreshDynamicInterpFields() {
 }
 
 void lpm_t::setupBDFEXT() {
-  if (nrs == nullptr) {
+  if (!userBDFEXTPhysics_) {
     nekrsCheck(true,
                MPI_COMM_SELF,
                EXIT_FAILURE,
                "%s\n",
-               "Cannot setup BDFEXT without attaching nrs_t!");
+                "lpm_t::setupBDFEXT requires user-defined physics via setUserBDFEXTPhysics(...)!");
   }
 
   // Register particle velocity DOFs
@@ -364,32 +364,9 @@ void lpm_t::setupBDFEXT() {
   addVariable("vy"); // y-velocity
   addVariable("vz"); // z-velocity
 
-  // nrs->o_U is a static field
-  addInterpField("Velocity", 
-                 mesh->dim,         // 3 components (u, v, w)
-                 nrs->fieldOffset,
-                 nrs->o_U,
-                 true);
-
-  // Vorticity added as a dynamic field since it needs to be recomputed at each time step
-  auto vorticityProvider = [this]() -> occa::memory {
-    auto o_SijOij = nrs->strainRotationRate(false);
-    return o_SijOij.slice(6*nrs->fieldOffset, 3*nrs->fieldOffset); // ωz, ωy, ωx are at offsets 6,7,8
-  };
-  addDynamicInterpField("Vorticity",
-                        mesh->dim,         // 3 components (ωz, ωy, ωx)
-                        nrs->fieldOffset,
-                        vorticityProvider);
-
-  // Material derivative added as a dynamic field since it needs to be recomputed at each time step
-  auto dudtProvider = [this]() -> occa::memory {
-    // FIXME: Just a placeholder; actual DuDt computation should be implemented here
-    return nrs->o_U;
-  };
-  addDynamicInterpField("DuDt",
-                        mesh->dim,         // 3 components (DuDt, DvDt, DwDt)
-                        nrs->fieldOffset,
-                        dudtProvider);
+  // Note: Users should register additional dynamic interpolation fields
+  // needed for their physics function via registerDynamicInterpField()
+  // Example: lpm->registerDynamicInterpField("Vorticity", ...)
 
   // Explicit RHS term and paricle state vector at a time level added as properties
   for (int j=1; j<=solverOrder; j++) {
@@ -625,11 +602,21 @@ void lpm_t::integrate(double tf)
              EXIT_FAILURE,
              "%s\n",
              "cannot call integrate before calling initialize!");
-  nekrsCheck(!userRHS_,
-             platform->comm.mpiComm(),
-             EXIT_FAILURE,
-             "%s\n",
-             "cannot call integrate without setting a userRHS!");
+  
+  if (solverType==SolverType::BDFEXT) {
+    nekrsCheck(!userBDFEXTPhysics_,
+               platform->comm.mpiComm(),
+               EXIT_FAILURE,
+               "%s\n",
+               "cannot call integrateBDFEXT without setting a userBDFEXTPhysics!");
+  }
+  else {
+    nekrsCheck(!userRHS_,
+               platform->comm.mpiComm(),
+               EXIT_FAILURE,
+               "%s\n",
+               "cannot call integrate without setting a userRHS!");
+  }
 
   if (timerLevel != TimerLevel::None) {
     platform->timer.tic(timerName + "integrate");
@@ -640,6 +627,8 @@ void lpm_t::integrate(double tf)
   // interpolated fields
   if (time >= tf) {
     for (auto [fieldName, o_field] : laggedInterpFields) {
+      refreshDynamicInterpFields(); // Ensure dynamic fields are up-to-date
+
       const auto Nfields = numFieldsInterp(fieldName);
       const auto offset = offsetFieldsInterp[fieldName];
       auto o_currentField = interpFieldInputs.at(fieldName);
@@ -697,7 +686,7 @@ void lpm_t::integrate(double tf)
     if (solverType == SolverType::AB) {
       integrateAB();
     } else if (solverType == SolverType::BDFEXT) {
-        integrateBDFEXT();
+      integrateBDFEXT();
     } else if (solverType == SolverType::RK) {
       integrateRK();
     }
@@ -812,40 +801,45 @@ void lpm_t::integrateBDFEXT()
   // helps readability
   occa::memory& o_yHist = o_ydot;
 
-  // lag derivatives and previous states
+  // At this point, we have fluid information from the end of current fluid step, lets call it step 0
+  // We know particle states at steps -1, -2, -3
+  // We know A and f at steps -2, -3, -4
+  // o_yHist currently stores -2, -3, -4
   if (nParticles_>0) {
-    const auto N = nDOFs_ * fieldOffset_;
+    const auto dofSize = nDOFs_*fieldOffset_;
+    const auto propSize = (numProps("f1") + numProps("A1"))*fieldOffset_;
     for (int s=solverOrder; s>1; s--) {
-      // Lag properties: [f(s-1),A(s-1)] -> [f(s),A(s)]
-      // thankfully f and A are stored contiguously in o_prop
-      const auto propoffset_src  = propId("f"+std::to_string(s-1)) * fieldOffset_;
+      // Lag properties: -3 overwrites -4, -2 overwrites -3
       const auto propoffset_dest = propId("f"+std::to_string(s)) * fieldOffset_;
-      const auto propCount = numProps("f1") + numProps("A1");
-      o_prop.copyFrom(o_prop, propCount*fieldOffset_, propoffset_dest, propoffset_src);
+      const auto propoffset_src  = propId("f"+std::to_string(s-1)) * fieldOffset_;
+      o_prop.copyFrom(o_prop, propSize, propoffset_dest, propoffset_src);
 
-      const auto N = nDOFs_ * fieldOffset_;
-      o_yHist.copyFrom( o_yHist, N, (s-1)*N, (s-2)*N );
+      // Lag states: -3 overwrites -4, -2 overwrites -3, -1 in y overwrites -2 in yHist
+      o_yHist.copyFrom( o_yHist, dofSize, (s-1)*dofSize, (s-2)*dofSize );
     }
-    o_yHist.copyFrom(o_y, N);
+    o_yHist.copyFrom(o_y, dofSize);
   }
+  // At this point:
+  // o_prop at f1, A1 contains data from level -2 (stale data). This needs to be updated by a userBDFEXTPhysics call
 
   platform->timer.tic(timerName + "integrate::userRHS");
   deviceMemory<dfloat> o_y_(o_y);
   deviceMemory<dfloat> o_f_(getProp("f1"));
-  userRHS_(this, time, o_y_, userdata_, o_f_);
+  deviceMemory<dfloat> o_A_(getProp("A1"));
+  userBDFEXTPhysics_(this, time, o_y_, userdata_, o_f_, o_A_);
   platform->timer.toc(timerName + "integrate::userRHS");
+  // We now have available f and A at -1. -1,-2,-3 data is used for extrapolation to step 0
 
-  if (nParticles_ > 0) {
-    launchKernel("lpm-integrate-bdfext",
-                 mesh->Nlocal,
-                 nDOFs_,
-                 fieldOffset_,
-                 g0BDF,
-                 o_coeffBDF,
-                 o_coeffEXTp,
-                 o_prop,
-                 o_y);
+  if (nParticles_>0) {
+    const auto extOrder = std::min(tstep, solverOrder);
+    const auto Nprop = (numProps("f1") + numProps("A1"));
+    auto o_fA = o_prop.slice( propId("f1")*fieldOffset_, extOrder*Nprop*fieldOffset_ );
+    poolDeviceMemory<dfloat> o_fAext(Nprop*fieldOffset_);
+    platform->linAlg->fill(Nprop*fieldOffset_, 0.0, o_fAext);
+    nStagesSumManyKernel(nParticles_, fieldOffset_, extOrder, Nprop, o_coeffEXTp, o_fA, o_fAext);
   }
+
+  // At the end of this particle step, we will have o_y at 0, o_prop at -1
 }
 
 void lpm_t::integrateRK()

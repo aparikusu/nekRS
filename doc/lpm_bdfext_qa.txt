@@ -1612,3 +1612,305 @@ into specific Q&A entries as needed. The design evolved significantly through
 discussion - key pivots documented in "Design Evolution" section.
 
 ================================================================================
+Q18: Using Pre-allocated Temporary Buffers (o_ytmp, o_k)
+================================================================================
+**Date**: November 20, 2025
+**Context**: Discussion about memory allocation strategy for BDFEXT kernel
+
+**Question**: 
+Should we use poolDeviceMemory for temporary storage in BDFEXT, or are there 
+pre-allocated buffers available?
+
+**Answer**:
+nekRS LPM already allocates persistent temporary buffers that can be reused:
+
+**Available Buffers** (from lpm.cpp constructor):
+```cpp
+o_ytmp = platform->device.malloc<dfloat>(nDOFs_ * offset);
+o_k = platform->device.malloc<dfloat>((std::max(solverOrder, bootstrapRKOrder) * nDOFs_) * offset);
+```
+
+**Buffer Sizes**:
+- `o_ytmp`: nDOFs_ * fieldOffset_ (one full state: positions + velocities)
+- `o_k`: max(solverOrder, bootstrapRKOrder) * nDOFs_ * fieldOffset_ (multiple stages)
+
+**Recommended Usage for BDFEXT**:
+1. **For extrapolated properties [f_ext, A_ext]** (7 components):
+   - Use `o_k` (first 7*fieldOffset_ elements)
+   - Already allocated, plenty of space available
+
+2. **For RHS assembly**:
+   - Use `o_ytmp` to store intermediate RHS
+   - Or reuse `o_k + offset` if both needed simultaneously
+
+3. **For velocity solve**:
+   - Can overwrite portions after extrapolation is complete
+   - No need for additional allocations
+
+**Advantages**:
+- No dynamic allocation overhead (eliminates poolDeviceMemory calls)
+- Follows existing nekRS pattern (RK methods use o_k for stages)
+- Memory already pinned and ready on device
+- Consistent with how integrateRK() reuses o_k for k1, k2, k3, etc.
+
+**Example Pattern** (from integrateRK2):
+```cpp
+occa::memory o_k1, o_k2;
+{
+  o_k1 = o_k + 0 * nDOFs_ * fieldOffset_;
+  o_k2 = o_k + 1 * nDOFs_ * fieldOffset_;
+}
+```
+
+**For BDFEXT**:
+```cpp
+auto o_fAext = o_k;                    // 7 components per particle
+auto o_rhs = o_ytmp;                   // nDOFs_ per particle  
+// ... perform computations ...
+```
+
+**Key Insight**: 
+Pre-allocated buffers are a deliberate design pattern in nekRS to avoid 
+malloc/free overhead during timestepping. Always check for existing buffers 
+before introducing new allocations.
+
+================================================================================
+Q19: Available Matrix Solve Kernels in nekRS
+================================================================================
+**Date**: November 20, 2025
+**Context**: Searching for existing linear solve functionality for 3×3 systems
+
+**Question**: 
+Does nekRS have a built-in kernel for solving Ax = b systems, especially for 
+small 3×3 matrices?
+
+**Answer**:
+**NO general-purpose "solve Ax=b" kernel exists**, but there is relevant 
+infrastructure:
+
+**Found in src/core/elliptic/kernels/computeStiffnessMatrix.okl**:
+
+1. **`determinant(double A[3][3])`** - Computes 3×3 determinant
+   ```cpp
+   double d_1 = A[0][0] * (A[1][1] * A[2][2] - A[2][1] * A[1][2]);
+   double d_2 = A[0][1] * (A[1][0] * A[2][2] - A[2][0] * A[1][2]);
+   double d_3 = A[0][2] * (A[1][0] * A[2][1] - A[2][0] * A[1][1]);
+   return d_1 - d_2 + d_3;
+   ```
+
+2. **`inverse(double invA[3][3], double A[3][3])`** - Computes 3×3 matrix inverse
+   - Uses cofactor method
+   - Efficient for small matrices
+   - **Device function** (not @kernel) - callable from within kernels
+
+**Host-side** (not useful for kernels):
+- `linAlg_t::matrixInverse(N, A)` in `src/platform/linAlg/matrixInverse.cpp`
+- Uses LAPACK (dgetrf/dgetri) for general N×N
+- CPU-only, not available on device
+
+**Options for BDFEXT 3×3 Solve**:
+
+**Option 1: Use existing inverse() + manual multiply**
+```cpp
+@kernel void solve3x3BDFEXT(...) {
+  for (...) {
+    // Build LHS matrix
+    dfloat LHS[3][3];
+    LHS[0][0] = g0 - dt*A_ext[0]; // diagonal
+    LHS[1][1] = g0 - dt*A_ext[1];
+    LHS[2][2] = g0 - dt*A_ext[2];
+    LHS[0][1] = -dt*A_ext[3];     // off-diagonal
+    // ... etc
+    
+    dfloat invLHS[3][3];
+    inverse(invLHS, LHS);  // Call existing function
+    
+    // Matrix-vector multiply: v_new = invLHS * rhs
+    for (int i = 0; i < 3; i++) {
+      v_new[i] = invLHS[i][0]*rhs[0] + invLHS[i][1]*rhs[1] + invLHS[i][2]*rhs[2];
+    }
+  }
+}
+```
+
+**Option 2: Implement Cramer's rule directly** (RECOMMENDED)
+```cpp
+@kernel void solve3x3BDFEXT(...) {
+  for (...) {
+    // Build LHS
+    dfloat LHS[3][3] = { ... };
+    
+    // Compute determinant once
+    dfloat det = determinant(LHS); // Use existing function
+    
+    // Solve using Cramer's rule (3 sub-determinants)
+    v_new[0] = det_x / det;
+    v_new[1] = det_y / det;
+    v_new[2] = det_z / det;
+  }
+}
+```
+
+**Why Cramer's Rule is Better for 3×3**:
+- More efficient: ~40 FLOPs vs ~60 for inverse + multiply
+- Avoids computing full inverse (9 elements)
+- Only need 4 determinants (1 main + 3 for numerators)
+- Numerically stable for well-conditioned systems
+- Direct solution without intermediate storage
+
+**Implementation Note**:
+The `inverse()` function is a **device function** (not @kernel), so it can be 
+called from within your BDFEXT kernel but cannot be launched directly. This is 
+the standard OCCA pattern for code reuse within kernels.
+
+**Recommendation**:
+Write a minimal custom kernel using Cramer's rule. You can reuse the existing 
+`determinant()` function for the main determinant, then compute the three 
+numerator determinants inline. Total kernel size: ~30-40 lines.
+
+================================================================================
+Q20: Kernel Implementation Strategy - Fused vs Decomposed
+================================================================================
+**Date**: November 20, 2025
+**Context**: Deciding between monolithic kernel vs using built-in operations
+
+**Question**: 
+Should we write one large fused kernel that does everything (extrapolation, 
+solve, update), or decompose the work using nekRS's built-in linAlg operations?
+
+**Answer**:
+**DECOMPOSED APPROACH RECOMMENDED** - matches nekRS design philosophy.
+
+**nekRS Coding Principles** (from codebase analysis):
+1. **Prefer core/built-in kernels when possible**
+   - nStagesSumMany, linAlg operations (axpby, fill, etc.)
+   - Well-tested, optimized, maintained
+   
+2. **Write custom kernels only for domain-specific operations**
+   - Operations unique to your module
+   - Can't be expressed with existing primitives
+   
+3. **Keep kernels focused and simple**
+   - Single responsibility
+   - Easier to debug, maintain, optimize
+   
+4. **Use @restrict for all kernel pointers**
+   - Compiler hint for non-aliasing
+   - Enables vectorization (10-50% speedup)
+
+**Decomposed BDFEXT Implementation**:
+
+**Step 1: Extrapolate properties** (BUILT-IN)
+```cpp
+// Use existing nStagesSumManyKernel
+const auto Nprop = 7; // [f(3), A(4)]
+auto o_fA = o_prop.slice(...);
+auto o_fAext = o_k;
+platform->linAlg->fill(Nprop*fieldOffset_, 0.0, o_fAext);
+nStagesSumManyKernel(nParticles_, fieldOffset_, extOrder, Nprop, o_coeffEXTp, o_fA, o_fAext);
+```
+
+**Step 2: Build RHS** (BUILT-IN)
+```cpp
+// Use linAlg operations in loop
+auto o_rhs = o_ytmp;
+platform->linAlg->fill(nDOFs_*fieldOffset_, 0.0, o_rhs);
+
+for (int i = 0; i < extOrder; i++) {
+  auto o_yHist_i = o_yHist + i * nDOFs_ * fieldOffset_;
+  platform->linAlg->axpbyMany(nParticles_, nDOFs_, fieldOffset_, 
+                              coeffBDF[i], o_yHist_i, 1.0, o_rhs);
+}
+
+// Add dt*f_ext (velocity components only)
+auto o_f_ext = o_fAext;
+auto o_rhs_vel = o_rhs + velOffset;
+platform->linAlg->axpbyMany(nParticles_, 3, fieldOffset_, 
+                            dt, o_f_ext, 1.0, o_rhs_vel);
+```
+
+**Step 3: Solve 3×3 system** (CUSTOM KERNEL - minimal)
+```cpp
+// Only this needs custom kernel - ~30 lines
+solve3x3BDFEXTKernel(nParticles_, fieldOffset_, g0, dt, 
+                     o_A_ext, o_rhs_vel, o_v_new);
+```
+
+**Step 4: Update positions** (BUILT-IN)
+```cpp
+// Use linAlg->axpbyzMany
+auto o_x_old = o_yHist + posOffset;
+auto o_x_new = o_y + posOffset;
+auto o_v_new = o_y + velOffset;
+platform->linAlg->axpbyzMany(nParticles_, 3, fieldOffset_, 
+                             1.0, o_x_old, dt, o_v_new, o_x_new);
+```
+
+**Step 5: Copy velocity** (BUILT-IN)
+```cpp
+// Use copyFrom or linAlg->copy
+o_y.slice(velOffset, 3*fieldOffset_).copyFrom(o_v_new);
+```
+
+**Comparison**:
+
+| Aspect | Fused Kernel | Decomposed |
+|--------|-------------|------------|
+| Lines of custom code | ~150 | ~30 |
+| Kernel launches | 1 | ~6 |
+| Maintainability | Complex | Simple |
+| Debugging | Hard | Easy |
+| Reusability | Low | High |
+| Performance | Best | Excellent* |
+
+*Kernel launch overhead is ~10-20 μs each, total ~100 μs for 6 launches.
+For 10^5 particles, solve time >> launch overhead.
+
+**Performance Analysis**:
+- Kernel launch overhead: ~100-200 μs total (6 launches × 15-30 μs)
+- Particle update time (10^5 particles): ~1-5 ms
+- Launch overhead: < 5% of total time
+- **Verdict**: Negligible performance cost for significantly better code quality
+
+**The Custom Kernel** (only part needed):
+```cpp
+@kernel void solve3x3BDFEXT(const dlong nParticles,
+                             const dlong fieldOffset,
+                             const dfloat g0,
+                             const dfloat dt,
+                             @restrict const dfloat *A_ext,  // 4 components
+                             @restrict const dfloat *rhs,    // 3 components
+                             @restrict dfloat *v_new)        // 3 components
+{
+  for (dlong p = 0; p < nParticles; ++p; @tile(p_blockSize, @outer, @inner)) {
+    // Build LHS = g0*I - dt*A
+    dfloat LHS[3][3];
+    LHS[0][0] = g0 - dt*A_ext[p + 0*fieldOffset]; // a_11
+    LHS[1][1] = g0 - dt*A_ext[p + 1*fieldOffset]; // a_22
+    LHS[2][2] = g0 - dt*A_ext[p + 2*fieldOffset]; // a_33
+    
+    const dfloat a12 = A_ext[p + 3*fieldOffset];
+    LHS[0][1] = -dt*a12;
+    LHS[1][0] =  dt*a12; // anti-symmetric
+    
+    // ... similar for a13, a23
+    
+    // Solve using Cramer's rule or call inverse()
+    dfloat det = determinant(LHS);
+    // ... compute v_new
+  }
+}
+```
+
+**Recommendation**:
+Use decomposed approach. Write the minimal solve3x3BDFEXT kernel (~30 lines), 
+use built-in operations for everything else. This follows nekRS best practices 
+and results in more maintainable code with negligible performance cost.
+
+**Key Insight**:
+GPU kernel launch overhead is negligible compared to actual computation for 
+realistic particle counts (10^4 - 10^6). Optimize for code clarity first, 
+then profile if performance issues arise. Premature optimization through 
+kernel fusion often leads to unmaintainable code.
+
+================================================================================

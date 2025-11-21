@@ -34,14 +34,14 @@ public:
                                              const deviceMemory<dfloat>& o_y,
                                              void *userdata,
                                              deviceMemory<dfloat>& o_ydot)>;
- 
-  lpm_t(mesh_t* mesh, dfloat* dt, dfloat bb_tol = 0.01, dfloat newton_tol = 0.0);
+  using bdfextPhysicsFunc_t = std::function<void(lpm_t *lpm,
+                                                  double time,
+                                                  const deviceMemory<dfloat>& o_y,
+                                                  void *userdata,
+                                                  deviceMemory<dfloat>& o_f,
+                                                  deviceMemory<dfloat>& o_A)>;
 
-  void attachNRS(nrs_t* nrs_) {
-    nekrsCheck(initialized_, platform->comm.mpiComm(), EXIT_FAILURE, 
-               "%s\n", "Cannot attach NRS after initialization!");
-    nrs = nrs_;
-  }
+  lpm_t(mesh_t* mesh, dfloat* dt, dfloat bb_tol = 0.01, dfloat newton_tol = 0.0);
 
   // set extrapolation order
   void extOrder(int order);
@@ -141,6 +141,10 @@ public:
 
   // Required user RHS
   void setUserRHS(rhsFunc_t userRHS);
+
+  void setUserBDFEXTPhysics(bdfextPhysicsFunc_t userBDFEXTPhysics) {
+    userBDFEXTPhysics_ = userBDFEXTPhysics;
+  };
 
   // Optionally set user ODE solver
   void setUserODESolver(odeSolverFunc_t userODESolver)
@@ -285,8 +289,6 @@ public:
 private:
   mesh_t *mesh;
 
-  nrs_t* nrs = nullptr;
-
   dfloat* dtOuter;
 
   int nEXT;
@@ -362,7 +364,16 @@ private:
   void integrateRK3();
   void integrateRK4();
 
+  // We solve: qdot = A^n q^n + f^n
+  // A^n (implicit forcing) and f^n(explicit forcing) are evaluated through extrapolation
+  // A^n q^n is moved to the LHS and qdot is discretized with BDF
   void integrateBDFEXT();
+
+  // Function to evaluate A^n
+  void evalImplicitForcing(const dfloat* interpData, const dfloat* y, dfloat* A);
+
+  // Function to evaluate f^n
+  void evalExplicitForcing(const dfloat* interpData, const dfloat* y, dfloat* f);
 
   // generate set of all output DOFs, sans {x,y,z}
   std::set<std::string> nonCoordinateOutputDOFs() const;
@@ -410,6 +421,8 @@ private:
   std::vector<dfloat> dt; // previous time steps
 
   rhsFunc_t userRHS_ = nullptr;
+  bdfextPhysicsFunc_t userBDFEXTPhysics_ = nullptr;
+
   odeSolverFunc_t userODESolver_ = nullptr;
 
   enum class FieldType { DOF, PROP, INTERP_FIELD };

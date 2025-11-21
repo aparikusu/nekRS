@@ -36,3 +36,112 @@
     }
   }
 }
+
+@kernel void integrateBDFEXT(const dlong N,
+                              const dfloat dt,
+                              const int order,
+                              const dlong fieldOffset,
+                              const dlong nDOFs,
+                              const dlong nProps,
+                              const dfloat g0BDF,
+                              @restrict const dfloat *coeffBDF,
+                              @restrict const dfloat *coeffEXTp,
+                              @restrict const dfloat *yHist,
+                              @restrict const dfloat *prop,
+                              @restrict dfloat *y) 
+{
+  // Each thread processes ONE particle
+  for (dlong i = 0; i < N; ++i; @tile(p_blockSize, @outer, @inner)) 
+  {
+    // STEP 1: Extrapolate properties to current time (in registers)
+    dfloat propEXT[7];  // [fx, fy, fz, A_xy, A_xz, A_yz, A_diag]
+    for (int fld = 0; fld < 7; ++fld) {
+      propEXT[fld] = 0.0;
+    }
+    
+    for (int s = 0; s < order; ++s) {
+      const dfloat coef = coeffEXTp[s];
+      const dlong offset_s = s * 7 * fieldOffset;  // Offset to time level s
+      for (int fld = 0; fld < 7; ++fld) {
+        propEXT[fld] += coef * prop[i + fld*fieldOffset + offset_s];
+      }
+    }
+
+    // STEP 2: Construct LHS = g0*I - dt*A
+    // A is anti-symmetric with structure:
+    // A = [ [ a_d,  a_xy,  a_xz],
+    //       [-a_xy,  a_d,  a_yz],
+    //       [-a_xz, -a_yz,  a_d] ]
+    // where a_d = A_diag, a_xy = A_xy, etc.
+    
+    dfloat LHS[3][3];
+    const dfloat a_xy = propEXT[3];
+    const dfloat a_xz = propEXT[4];
+    const dfloat a_yz = propEXT[5];
+    const dfloat a_d  = propEXT[6];
+    
+    LHS[0][0] = g0BDF - dt*a_d;   LHS[0][1] = -dt*a_xy;       LHS[0][2] = -dt*a_xz;
+    LHS[1][0] = dt*a_xy;          LHS[1][1] = g0BDF - dt*a_d; LHS[1][2] = -dt*a_yz;
+    LHS[2][0] = dt*a_xz;          LHS[2][1] = dt*a_yz;        LHS[2][2] = g0BDF - dt*a_d;
+
+    // STEP 3: Construct RHS = sum(coeffBDF[s] * v^{n-s}) + dt*f_ext
+    // where v^{n-s} are velocity history (DOFs 3,4,5 = vx,vy,vz)
+    dfloat RHS[3];
+    
+    // Initialize with dt*f_ext
+    RHS[0] = dt * propEXT[0];  // fx
+    RHS[1] = dt * propEXT[1];  // fy
+    RHS[2] = dt * propEXT[2];  // fz
+    
+    // Add BDF history term: sum_s coeffBDF[s] * v^{n-s}
+    for (int s=0; s<order; ++s) {
+      const dfloat coef = coeffBDF[s];
+      const dlong offset_s = s*nDOFs*fieldOffset;
+      
+      // Velocity DOFs are indices 3, 4, 5 (vx, vy, vz)
+      RHS[0] += coef * yHist[i + 3*fieldOffset + offset_s];  // vx
+      RHS[1] += coef * yHist[i + 4*fieldOffset + offset_s];  // vy
+      RHS[2] += coef * yHist[i + 5*fieldOffset + offset_s];  // vz
+    }
+
+    // STEP 4: Solve 3x3 system LHS * v_new = RHS using Cramer's rule or direct inversion
+    // For 3x3, Cramer's rule is efficient and avoids pivoting
+    
+    // Compute determinant
+    const dfloat det = LHS[0][0] * (LHS[1][1]*LHS[2][2] - LHS[1][2]*LHS[2][1])
+                     - LHS[0][1] * (LHS[1][0]*LHS[2][2] - LHS[1][2]*LHS[2][0])
+                     + LHS[0][2] * (LHS[1][0]*LHS[2][1] - LHS[1][1]*LHS[2][0]);
+    
+    const dfloat invDet = 1.0 / det;
+    
+    // Solve using Cramer's rule
+    dfloat v_new[3];
+    
+    // v_new[0] = det(RHS, col1, col2) / det
+    v_new[0] = invDet * (RHS[0] * (LHS[1][1]*LHS[2][2] - LHS[1][2]*LHS[2][1])
+                       - LHS[0][1] * (RHS[1]*LHS[2][2] - LHS[1][2]*RHS[2])
+                       + LHS[0][2] * (RHS[1]*LHS[2][1] - LHS[1][1]*RHS[2]));
+    
+    // v_new[1] = det(col0, RHS, col2) / det
+    v_new[1] = invDet * (LHS[0][0] * (RHS[1]*LHS[2][2] - LHS[1][2]*RHS[2])
+                       - RHS[0] * (LHS[1][0]*LHS[2][2] - LHS[1][2]*LHS[2][0])
+                       + LHS[0][2] * (LHS[1][0]*RHS[2] - RHS[1]*LHS[2][0]));
+    
+    // v_new[2] = det(col0, col1, RHS) / det
+    v_new[2] = invDet * (LHS[0][0] * (LHS[1][1]*RHS[2] - RHS[1]*LHS[2][1])
+                       - LHS[0][1] * (LHS[1][0]*RHS[2] - RHS[1]*LHS[2][0])
+                       + RHS[0] * (LHS[1][0]*LHS[2][1] - LHS[1][1]*LHS[2][0]));
+
+    // STEP 5: Update positions using Forward Euler: x_new = x_old + dt * v_new
+    // Position DOFs are indices 0, 1, 2 (x, y, z)
+    for (int dof = 0; dof < 3; ++dof) {
+      const dfloat x_old = yHist[i + dof*fieldOffset];  // Most recent position (slot 0)
+      y[i + dof*fieldOffset] = x_old + dt * v_new[dof];
+    }
+    
+    // STEP 6: Write velocity solution
+    for (int dof = 0; dof < 3; ++dof) {
+      y[i + (dof+3)*fieldOffset] = v_new[dof];
+    }
+  }
+}
