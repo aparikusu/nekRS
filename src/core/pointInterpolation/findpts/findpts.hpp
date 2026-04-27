@@ -162,6 +162,25 @@ public:
 
   crystal *crystalRouter();
 
+  // exposed so application code can read per-element OBBs / AABBs and the local hash for
+  // building neighborhood / projection routing tables for 2-way LPT
+  void *gslibHandle() { return _findptsData; }
+
+  // Bundle of device-resident gslib local hash state, exposed for user-side
+  // candidate-element kernels (e.g. neighborhood projection in 2-way LPT).
+  // All views are read-only; do not modify.
+  struct hashHandle_t {
+    dlong hash_n;                  // bins per dimension (n^3 bins total)
+    const occa::memory &o_offset;  // CSR offsets + flat element list (dlong)
+    const occa::memory &o_hashMin; // dfloat[3], per-dim bin origin
+    const occa::memory &o_hashFac; // dfloat[3], per-dim 1/binSize
+  };
+  
+  hashHandle_t hashHandle() const {
+    return hashHandle_t{ hash_n, o_offset, o_hashMin, o_hashFac };
+  }
+
+
 private:
   static constexpr int maxFields = 30;
 

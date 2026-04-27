@@ -979,6 +979,7 @@ void lpm_t::sendReceiveDataImpl(const std::vector<dfloat> &sendData,
       recvData[N * pid + j] = p.data[j];
     }
   }
+  // array_free(&transfer); // Adi: free call was missing here
 }
 
 std::tuple<std::vector<dfloat>, std::vector<dfloat>, std::vector<dlong>, std::vector<dlong>>
